@@ -15,7 +15,11 @@
         enableInline: true, // 启用行内增强渲染
         autoInference: false, // 回复后自动推理
         autoPlay: false, // 推理完成后自动播放（需要浏览器已有用户交互）
+        streamingPlay: false, // 逐句推理即时播放（推理完一句立即播放，无需等全部完成）
         cacheImportPath: '\\\\SillyTavern\\\\data\\\\TTSsound',
+        ambientSoundVolume: 0.4, // 背景音独立音量 0.0 ~ 1.0
+        ambientFadeDuration: 0, // 背景音淡入淡出时长(ms)，0=关闭
+        ambientLoopByScene: false, // 场景循环播放：同场景段内背景音持续循环
         // VN format: [角色|表情]|「对话」 or [旁白]|描述
         vnRegex: '^\\[([^\\]|]+)(?:\\|[^\\]]*)?\\]\\|(.+)$',
         voiceMap: {}, // { cardId: { characterName: "voice.wav" } }
@@ -507,6 +511,208 @@
         return { init, setHandle, getHandle, requestPermission };
     })();
 
+    // ==================== Ambient Sound Player ====================
+    const AmbientPlayer = (function () {
+        let dirHandle = null;       // FileSystemDirectoryHandle for ambient folder
+        let currentScene = null;    // currently playing scene name
+        let currentAudio = null;    // HTMLAudioElement
+        let fadeTimer = null;       // rAF handle for fade
+        function _getFadeDuration() {
+            return parseInt(getSettings().ambientFadeDuration ?? 0) || 0;
+        }
+
+        async function init() {
+            try {
+                const saved = await AudioStorage.getConfig('ambientDirHandle');
+                if (saved) { dirHandle = saved; console.log('[IndexTTS2][Ambient] dir handle restored'); }
+            } catch (e) { console.warn('[IndexTTS2][Ambient] init error:', e); }
+        }
+
+        async function setDirHandle(handle) {
+            if (!handle) return;
+            dirHandle = handle;
+            await AudioStorage.saveConfig('ambientDirHandle', handle);
+        }
+
+        function getDirHandle() { return dirHandle; }
+
+        async function queryPermission() {
+            if (!dirHandle) return false;
+            try {
+                return (await dirHandle.queryPermission({ mode: 'read' })) === 'granted';
+            } catch (e) { console.warn('[IndexTTS2][Ambient] queryPermission error:', e); }
+            return false;
+        }
+
+        async function requestPermission() {
+            if (!dirHandle) return false;
+            try {
+                if ((await dirHandle.queryPermission({ mode: 'read' })) === 'granted') return true;
+                if ((await dirHandle.requestPermission({ mode: 'read' })) === 'granted') return true;
+            } catch (e) { console.warn('[IndexTTS2][Ambient] permission error:', e); }
+            return false;
+        }
+
+        function _getVolume() {
+            const s = getSettings();
+            return Math.max(0, Math.min(1, parseFloat(s.ambientSoundVolume ?? 0.4)));
+        }
+
+        function _cancelFade() {
+            if (fadeTimer !== null) { cancelAnimationFrame(fadeTimer); fadeTimer = null; }
+        }
+
+        function _fadeOut(audioEl, onDone) {
+            _cancelFade();
+            const fadeDur = _getFadeDuration();
+            if (!fadeDur) {
+                audioEl.pause();
+                audioEl.src = '';
+                if (onDone) onDone();
+                return;
+            }
+            const start = performance.now();
+            const startVol = audioEl.volume;
+            function step(now) {
+                const t = Math.min(1, (now - start) / fadeDur);
+                audioEl.volume = startVol * (1 - t);
+                if (t < 1) { fadeTimer = requestAnimationFrame(step); }
+                else {
+                    audioEl.pause();
+                    audioEl.src = '';
+                    fadeTimer = null;
+                    if (onDone) onDone();
+                }
+            }
+            fadeTimer = requestAnimationFrame(step);
+        }
+
+        function _fadeIn(audioEl) {
+            _cancelFade();
+            const target = _getVolume();
+            const fadeDur = _getFadeDuration();
+            if (!fadeDur) {
+                audioEl.volume = target;
+                return;
+            }
+            audioEl.volume = 0;
+            const start = performance.now();
+            function step(now) {
+                const t = Math.min(1, (now - start) / fadeDur);
+                audioEl.volume = target * t;
+                if (t < 1) { fadeTimer = requestAnimationFrame(step); }
+                else { fadeTimer = null; }
+            }
+            fadeTimer = requestAnimationFrame(step);
+        }
+
+        async function _loadScene(sceneName) {
+            console.log('[IndexTTS2][Ambient] _loadScene: sceneName=' + sceneName + ' dirHandle=' + (dirHandle ? dirHandle.name : 'NULL'));
+            if (!dirHandle) { console.warn('[IndexTTS2][Ambient] _loadScene: dirHandle is null, 请在设置中选择背景音目录'); return null; }
+            try {
+                // First try queryPermission (no gesture needed)
+                let hasPerm = await queryPermission();
+                console.log('[IndexTTS2][Ambient] _loadScene: queryPermission=' + hasPerm);
+                if (!hasPerm) {
+                    // Try reading directly — some browsers allow read without explicit grant
+                    console.warn('[IndexTTS2][Ambient] 权限未授权，请在设置面板点击「🔄 授权」按钮');
+                    if (window.toastr) window.toastr.warning('背景音需要授权：请打开 IndexTTS2 设置 → 背景音效 → 点击「🔄 授权」', { timeOut: 6000 });
+                    return null;
+                }
+                // Try candidate file names: exact, plus common extensions
+                const candidates = [
+                    sceneName + '.mp3', sceneName + '.wav', sceneName + '.ogg',
+                    sceneName + '.m4a', sceneName + '.aac'
+                ];
+                for (const name of candidates) {
+                    try {
+                        console.log('[IndexTTS2][Ambient] _loadScene: trying file:', name);
+                        const fileHandle = await dirHandle.getFileHandle(name);
+                        const file = await fileHandle.getFile();
+                        const url = URL.createObjectURL(file);
+                        console.log('[IndexTTS2][Ambient] _loadScene: found! url=', url);
+                        return url;
+                    } catch (_) { /* not found, try next */ }
+                }
+                console.warn('[IndexTTS2][Ambient] _loadScene: no matching file for scene:', sceneName, '— tried:', candidates);
+            } catch (e) { console.warn('[IndexTTS2][Ambient] loadScene error:', e); }
+            return null;
+        }
+
+        async function playScene(sceneName) {
+            if (!sceneName) { stop(); return; }
+            // Same scene — keep playing without restart
+            if (sceneName === currentScene && currentAudio && !currentAudio.paused) return;
+
+            const url = await _loadScene(sceneName);
+            if (!url) {
+                // No file found — silently do nothing
+                console.log('[IndexTTS2][Ambient] no file for scene:', sceneName);
+                return;
+            }
+
+            const oldAudio = currentAudio;
+            currentScene = sceneName;
+
+            const audio = new Audio(url);
+            audio.loop = true;
+            audio.volume = 0;
+            currentAudio = audio;
+
+            // Fade out old audio
+            if (oldAudio && !oldAudio.paused) {
+                _fadeOut(oldAudio, null);
+            } else {
+                _cancelFade();
+            }
+
+            try {
+                console.log('[IndexTTS2][Ambient] playScene: calling audio.play() for scene:', sceneName);
+                await audio.play();
+                console.log('[IndexTTS2][Ambient] playScene: audio.play() succeeded');
+                _fadeIn(audio);
+            } catch (e) {
+                console.warn('[IndexTTS2][Ambient] play error:', e);
+                currentAudio = null;
+                currentScene = null;
+                URL.revokeObjectURL(url);
+            }
+        }
+
+        function stop() {
+            currentScene = null;
+            if (currentAudio) {
+                _fadeOut(currentAudio, null);
+                currentAudio = null;
+            }
+        }
+
+        function stopImmediate() {
+            _cancelFade();
+            currentScene = null;
+            if (currentAudio) {
+                currentAudio.pause();
+                currentAudio.src = '';
+                currentAudio = null;
+            }
+        }
+
+        function setVolume(vol) {
+            const v = Math.max(0, Math.min(1, parseFloat(vol) || 0));
+            const s = getSettings();
+            s.ambientSoundVolume = v;
+            saveSettings();
+            if (currentAudio && !currentAudio.paused) {
+                _cancelFade();
+                currentAudio.volume = v;
+            }
+        }
+
+        function getVolume() { return _getVolume(); }
+
+        return { init, setDirHandle, getDirHandle, requestPermission, playScene, stop, stopImmediate, setVolume, getVolume };
+    })();
+
     async function generateHash(character, voiceId, text, speed, volume, emotion) {
         const emotionPart = emotion ? `|${emotion}` : '';
         const input = `${character || ''}|${voiceId || ''}|${speed}|${volume}|${text || ''}${emotionPart}`;
@@ -632,6 +838,21 @@
                 }
             } catch (_) { /* 格式错误时静默忽略 */ }
 
+            // 格式 A-NEW: [角色][表情][场景]:「对话」（三重标签，含场景字段）
+            const threeTagRegex = /^\s*\[([^\]\n]+)\]\s*\[([^\]\n]*)\]\s*\[([^\]\n]+)\]\s*:?\s*([「“”『](.*?)[」””』]|.+)\s*$/;
+            const m3 = trimmed.match(threeTagRegex);
+            if (m3) {
+                const character = (m3[1] || '').replace(/\s+/g, ' ').trim();
+                const scene = (m3[3] || '').replace(/\s+/g, ' ').trim();
+                const rawContent = (m3[4] || '').trim();
+                const quoteInner = m3[5];
+                const inner = quoteInner !== undefined ? quoteInner.trim() : rawContent;
+                if (character && inner) {
+                    const r3 = { character, scene, dialogue: inner, rawContent, quoted: rawContent, isAction: false, isQuoted: quoteInner !== undefined, emotion };
+                    console.log('[IndexTTS2][Ambient] parseVNLine 三标签命中 character=' + character + ' scene=' + scene + ' dialogue=' + inner);
+                    return r3;
+                }
+            }
             // 格式 A0: [角色]|[表情]:「对话」 或 [角色][表情]:「对话」（表情后可带冒号）
             // 兼容: [王淑琴]|[职业微笑]:「...」 和 [王淑琴][职业微笑]:「...」
             const pipeTagRegex = /^\s*\[([^\]\n]+)\]\s*(?:\|\s*)?\[[^\]]*\]\s*:?\s*([「""『](.*?)[」""』]|.+)\s*$/;
@@ -1355,7 +1576,8 @@
                     original: trimmed,
                     parsed: parsed,
                     // Remove fallback to defaultVoice to detect unset state
-                    voice: voiceMap[parsed.character]
+                    voice: voiceMap[parsed.character],
+                    scene: parsed.scene || null
                 });
             }
         }
@@ -1500,9 +1722,11 @@
                 result.push({
                     text: parsed.dialogue,
                     character: parsed.character,
+                    scene: parsed.scene || null,
                     voice: voice !== undefined && voice !== null && voice !== '' ? voice : undefined,
                     emotion: parsed.emotion || null,
                 });
+                console.log('[IndexTTS2][Ambient] collectVNLines push: character=' + parsed.character + ' scene=' + (parsed.scene || 'null'));
             }
         }
         return result;
@@ -2189,6 +2413,7 @@
                         list.push({
                             text: line.text,
                             character: line.character,
+                            scene: line.scene || null,
                             voice: line.voice,
                             hash: record.hash,
                             blobUrl,
@@ -2300,6 +2525,22 @@
             const currentQueueId = Date.now();
             currentPlayback.sessionId = currentQueueId;
 
+            // Precompute scene segments for ambientLoopByScene mode
+            // Each playlist item gets: sceneSegStart, sceneSegEnd (inclusive indices of its scene run)
+            (function buildSceneSegments() {
+                let i = 0;
+                while (i < playlist.length) {
+                    const scene = playlist[i].scene;
+                    let j = i;
+                    while (j < playlist.length && playlist[j].scene === scene) j++;
+                    for (let k = i; k < j; k++) {
+                        playlist[k].sceneSegStart = i;
+                        playlist[k].sceneSegEnd = j - 1;
+                    }
+                    i = j;
+                }
+            })();
+
             const playTrack = (index, seekTime = 0) => {
                 // Session Check
                 if (currentPlayback.sessionId !== currentQueueId) return;
@@ -2338,6 +2579,18 @@
                 const vol = parseFloat(settings.volume || 1.0);
                 audio.volume = Math.max(0, Math.min(1, vol));
                 audio.playbackRate = parseFloat(settings.speed || 1.0);
+
+                // 场景背景音
+                console.log('[IndexTTS2][Ambient] playTrack index=' + index + ' scene=' + item.scene + ' dirHandle=' + (AmbientPlayer.getDirHandle() ? 'SET' : 'NULL'));
+                if (getSettings().ambientLoopByScene) {
+                    // 场景循环模式：仅在该 scene 段的第一条 track 启动背景音
+                    if (index === item.sceneSegStart) {
+                        console.log('[IndexTTS2][Ambient] LoopByScene: START scene=' + item.scene + ' seg=[' + item.sceneSegStart + ',' + item.sceneSegEnd + ']');
+                        AmbientPlayer.playScene(item.scene || null);
+                    }
+                } else {
+                    AmbientPlayer.playScene(item.scene || null);
+                }
 
                 // Seek if needed
                 if (seekTime > 0) {
@@ -2380,6 +2633,21 @@
                 // Events
                 audio.onended = () => {
                     setLinePlayingByEncoded(msg, encT, encC, false);
+                    if (getSettings().ambientLoopByScene) {
+                        // 场景循环模式：仅在该 scene 段的最后一条 track 结束时停止背景音
+                        const isLastInSeg = (index === item.sceneSegEnd);
+                        const isLastTrack = (index + 1 >= playlist.length);
+                        if (isLastInSeg || isLastTrack) {
+                            console.log('[IndexTTS2][Ambient] LoopByScene: STOP scene=' + item.scene + ' isLastTrack=' + isLastTrack);
+                            AmbientPlayer.stop();
+                        }
+                    } else {
+                        if (index + 1 >= playlist.length) {
+                            AmbientPlayer.stop();
+                        } else {
+                            AmbientPlayer.stopImmediate();
+                        }
+                    }
                     playTrack(index + 1);
                 };
                 audio.onerror = () => {
@@ -2624,6 +2892,10 @@
                                 <label for="indextts-auto-play">推理后自动播放</label>
                                 <input type="checkbox" id="indextts-auto-play"${settings.autoPlay === true ? ' checked' : ''}>
                             </div>
+                             <div class="indextts-setting-row checkbox-row">
+                                <label for="indextts-streaming-play">流式推理播放</label>
+                                <input type="checkbox" id="indextts-streaming-play"${settings.streamingPlay === true ? ' checked' : ''}>
+                            </div>
                             <div class="indextts-setting-row">
                                 <label>默认朗读音色</label>
                                 <input type="text" id="indextts-voice" class="text_pole" value="${settings.defaultVoice}">
@@ -2654,6 +2926,39 @@
                                     <button class="menu_button" id="indextts-export-cache" title="导出备份">📂 导出备份</button>
                                     <button class="menu_button" id="indextts-clear-cache" title="清空缓存">🗑️ 清空全部</button>
                                 </div>
+                            </div>
+                        </div>
+
+                        <!-- 模剗4：背景音效 -->
+                        <div class="indextts-setting-module">
+                            <div class="indextts-module-header">🎵 背景音效</div>
+                            <div class="indextts-path-container">
+                                <input type="text" id="indextts-ambient-path" class="indextts-path-display" value="" readonly placeholder="未选择背景音目录">
+                                <button class="menu_button" id="indextts-ambient-choose" title="选择背景音文件夹">📂 选择</button>
+                                <button class="menu_button" id="indextts-ambient-auth" title="重新授权目录读取权限" style="display:none;">🔄 授权</button>
+                            </div>
+                            <div class="indextts-setting-row">
+                                <label>背景音音量</label>
+                                <input type="range" id="indextts-ambient-volume" class="indextts-slider" min="0" max="1" step="0.05" value="${settings.ambientSoundVolume ?? 0.4}">
+                                <span id="indextts-ambient-volume-val">${((settings.ambientSoundVolume ?? 0.4) * 100).toFixed(0)}%</span>
+                            </div>
+                            <div class="indextts-setting-row">
+                                <label>淡入淡出</label>
+                                <select id="indextts-ambient-fade" class="text_pole">
+                                    <option value="0"${(settings.ambientFadeDuration ?? 0) == 0 ? ' selected' : ''}>关闭</option>
+                                    <option value="500"${(settings.ambientFadeDuration ?? 0) == 500 ? ' selected' : ''}>0.5 秒</option>
+                                    <option value="1000"${(settings.ambientFadeDuration ?? 0) == 1000 ? ' selected' : ''}>1 秒</option>
+                                    <option value="1500"${(settings.ambientFadeDuration ?? 0) == 1500 ? ' selected' : ''}>1.5 秒</option>
+                                    <option value="2000"${(settings.ambientFadeDuration ?? 0) == 2000 ? ' selected' : ''}>2 秒</option>
+                                    <option value="3000"${(settings.ambientFadeDuration ?? 0) == 3000 ? ' selected' : ''}>3 秒</option>
+                                </select>
+                            </div>
+                            <div class="indextts-setting-row" style="font-size:0.85em; opacity:0.7;">
+                                音效文件命名需与场景名称一致，支持 .mp3 / .wav / .ogg / .m4a
+                            </div>
+                            <div class="indextts-setting-row checkbox-row">
+                                <label for="indextts-ambient-loop-scene">场景循环播放</label>
+                                <input type="checkbox" id="indextts-ambient-loop-scene" ${settings.ambientLoopByScene ? 'checked' : ''}>
                             </div>
                         </div>
 
@@ -2714,6 +3019,7 @@
         bindCheckbox('#indextts-enable-inline', 'enableInline', true);
         bindCheckbox('#indextts-auto-inference', 'autoInference', false);
         bindCheckbox('#indextts-auto-play', 'autoPlay', false);
+        bindCheckbox('#indextts-streaming-play', 'streamingPlay', false);
 
         // Voice
         const voiceInput = panel.querySelector('#indextts-voice');
@@ -2768,6 +3074,71 @@
         bindPrompt('#indextts-prompt-depth', 'depth');
         bindPrompt('#indextts-prompt-role', 'role');
         bindPrompt('#indextts-prompt-content', 'content');
+
+        // ==================== Module 4: Ambient Sound ====================
+        const ambientChooseBtn = panel.querySelector('#indextts-ambient-choose');
+        if (ambientChooseBtn) {
+            ambientChooseBtn.onclick = async () => {
+                if (!window.showDirectoryPicker) {
+                    if (window.toastr) window.toastr.error('浏览器不支持目录选择');
+                    return;
+                }
+                try {
+                    const h = await window.showDirectoryPicker();
+                    await AmbientPlayer.setDirHandle(h);
+                    // Pre-authorize while still inside user gesture
+                    await AmbientPlayer.requestPermission();
+                    const el = panel.querySelector('#indextts-ambient-path');
+                    if (el) el.value = h.name;
+                    if (window.toastr) window.toastr.success('背景音目录已设置: ' + h.name);
+                } catch (e) {
+                    if (e.name !== 'AbortError') console.error('[IndexTTS2][Ambient]', e);
+                }
+            };
+            // Init display
+            const existingH = AmbientPlayer.getDirHandle();
+            const ambPathEl = panel.querySelector('#indextts-ambient-path');
+            if (existingH && ambPathEl) ambPathEl.value = existingH.name;
+            // Show auth button if handle exists but may need re-authorization
+            const ambAuthBtn = panel.querySelector('#indextts-ambient-auth');
+            if (ambAuthBtn) {
+                if (existingH) ambAuthBtn.style.display = 'inline-block';
+                ambAuthBtn.onclick = async () => {
+                    const ok = await AmbientPlayer.requestPermission();
+                    if (ok) {
+                        ambAuthBtn.style.display = 'none';
+                        if (window.toastr) window.toastr.success('背景音目录授权成功');
+                    } else {
+                        if (window.toastr) window.toastr.error('授权失败，请重新选择目录');
+                    }
+                };
+            }
+        }
+        const ambVolSlider = panel.querySelector('#indextts-ambient-volume');
+        if (ambVolSlider) {
+            ambVolSlider.oninput = (e) => {
+                const v = parseFloat(e.target.value);
+                AmbientPlayer.setVolume(v);
+                const disp = panel.querySelector('#indextts-ambient-volume-val');
+                if (disp) disp.textContent = Math.round(v * 100) + '%';
+            };
+        }
+        const ambFadeSelect = panel.querySelector('#indextts-ambient-fade');
+        if (ambFadeSelect) {
+            ambFadeSelect.onchange = (e) => {
+                const s = getSettings();
+                s.ambientFadeDuration = parseInt(e.target.value) || 0;
+                saveSettings();
+            };
+        }
+        const ambLoopSceneChk = panel.querySelector('#indextts-ambient-loop-scene');
+        if (ambLoopSceneChk) {
+            ambLoopSceneChk.onchange = (e) => {
+                const s = getSettings();
+                s.ambientLoopByScene = e.target.checked;
+                saveSettings();
+            };
+        }
 
         // ==================== Module 3: Audio Cache Management ====================
         const pathInputEl = panel.querySelector('#indextts-local-path');
@@ -3259,6 +3630,7 @@
         const loadedSettings = getSettings(); // Ensure settings exist
         console.log('[IndexTTS2] Loaded settings:', loadedSettings);
         LocalRepo.init();
+        AmbientPlayer.init();
         setupEventListeners();
         setInterval(polling, 2000);
         polling(); // Initial run
