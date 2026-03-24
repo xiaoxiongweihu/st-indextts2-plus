@@ -13,7 +13,7 @@ https://github.com/user-attachments/assets/bbcaed12-4d72-45fc-9404-a452b4b91ecf
 
 另外分享自己搜集的一些参考音频和酒馆大佬分享的各种女性配音，基本满足所有音色。
 
-百度网盘:https://pan.baidu.com/s/1cl2HjNs4N5jSr_-KnfS71w?pwd=whze
+[点此下载参考音频+背景音频](https://pan.baidu.com/s/13lCfZ265RqTxBXNTWSi8Bg?pwd=xyp2)
 
 <img width="583" height="340" alt="image" src="https://github.com/user-attachments/assets/c2a764ef-34e3-41a2-b802-4f2c16bba375" />
 
