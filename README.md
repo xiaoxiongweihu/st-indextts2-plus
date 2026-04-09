@@ -55,6 +55,7 @@ https://github.com/user-attachments/assets/bbcaed12-4d72-45fc-9404-a452b4b91ecf
 4. 与 AI 对话，语音将自动生成并播放
 
 > 参考音频文件放置于后端 `api/ckyp/` 目录，下拉框会自动列出所有可用文件。
+> 场景音频文件放置于后端 `api/pjy/` 目录，每次重启酒馆都需要点击授权才能生效。
 
 ---
 
