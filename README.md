@@ -1,4 +1,4 @@
-# indexTTS player
+# st-indextts2-plus
 
 基于 [indexTTS player](https://github.com/bronie-honkai/st-indextts2) 使用AI进行修改，让你的酒馆语音体验更加流畅。
 
